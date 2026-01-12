@@ -2,7 +2,8 @@ import smash
 import numpy as np
 import pandas as pd
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
 from sklearn.preprocessing import RobustScaler
 
 from datetime import timedelta
@@ -42,18 +43,12 @@ def model_to_df(
     tsy = _timestep_convert(model.setup.start_time, model.setup.dt, ntime_step)
     dict_df["timestep_in_year"] = np.tile(tsy, model.mesh.ng)
 
-    # % Simumated discharges
-    qs = model.response.q[..., :ntime_step]
-    qs[qs < 0] = 0
-    dict_df["discharge_sim"] = qs.flatten(order="C")
-
-    # % Bias
+    # % Discharge (target)
     if target_mode:
         qo = model.response_data.q[..., :ntime_step]
         qo[qo < 0] = np.nan
-        bias = qo - qs
-        dict_df["bias"] = bias.flatten(order="C")
-        dict_df["std_bias"] = np.zeros(bias.size)
+        discharge = qo  # - qs
+        dict_df["discharge"] = discharge.flatten(order="C")
 
     # % Mean precipitation
     if precip:
@@ -117,8 +112,6 @@ def feature_engineering(df: pd.DataFrame):
     df["year"] = df["timestep"] // np.max(df["timestep_in_year"])
     drop_cols = ["year"]
 
-    df["discharge_sim_cumsum"] = df.groupby(["code", "year"])["discharge_sim"].cumsum()
-
     try:
         df["precipitation_cumsum"] = df.groupby(["code", "year"])[
             "precipitation"
@@ -151,18 +144,15 @@ def df_to_network_in(
     df = df.drop(["id", "code", "timestep"], axis=1)
 
     if target_mode:
-        # check if 'bias' and 'std_bias' are already located in the last 2 columns
-        if df.columns[-2] != "bias" or df.columns[-1] != "std_bias":
-            columns = [col for col in df.columns if not "bias" in col]
-            columns = np.append(columns, ("bias", "std_bias"))
+        # check if 'discharge' is already located in the last column
+        if df.columns[-1] != "discharge":
+            columns = [col for col in df.columns if not "discharge" in col]
+            columns = np.append(columns, "discharge")
             df = df[columns]
 
         # convert to numpy array
-        data = df.to_numpy()[..., :-2]
-        if output_size == 1:
-            target = df.to_numpy()[..., -2]
-        else:
-            target = df.to_numpy()[..., -2:]
+        data = df.to_numpy()[..., :-1]
+        target = df.to_numpy()[..., -1]
         target = target.reshape(-1, sequence_size, output_size)
 
     else:
@@ -176,49 +166,56 @@ def df_to_network_in(
     return data, target
 
 
-def log_lkh(y_true, y_pred):
-    if y_pred.shape[-1] < 2:
-        return -tf.reduce_mean(
-            tf.math.log(1 / (tf.abs(y_pred) * tf.sqrt(2 * np.pi)))
-            - 0.5 * tf.square(y_true / y_pred)
-        )
+def nse(y_true, y_pred):
+    if y_true.dim() == 3:
+        y_true = y_true[..., 0]
+    if y_pred.dim() == 3:
+        y_pred = y_pred[..., 0]
+    y_true_mean = torch.mean(y_true, dim=1, keepdim=True)
+    num = torch.sum((y_true - y_pred) ** 2, dim=1)
+    den = torch.sum((y_true - y_true_mean) ** 2, dim=1)
+    score = 1.0 - (num / (den + 1e-8))
+    return torch.mean(score)
 
-    else:
-        return -tf.reduce_mean(
-            tf.math.log(1 / (tf.abs(y_pred[..., 1]) * tf.sqrt(2 * np.pi)))
-            - 0.5 * tf.square((y_true[..., 0] - y_pred[..., 0]) / y_pred[..., 1])
+
+def nse_loss(y_true, y_pred):
+    return 1.0 - nse(y_true, y_pred)
+
+
+class LSTMNet(nn.Module):
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__()
+        self.lstm1 = nn.LSTM(
+            input_size=input_size,
+            hidden_size=256,
+            batch_first=True,
+            bidirectional=True,
         )
+        self.lstm2 = nn.LSTM(
+            input_size=256 * 2,
+            hidden_size=128,
+            batch_first=True,
+            bidirectional=False,
+        )
+        self.fc1 = nn.Linear(128, 64)
+        self.act1 = nn.SELU()
+        self.fc2 = nn.Linear(64, output_size)
+        self.act2 = nn.ReLU()
+
+    def forward(self, x):
+        y, _ = self.lstm1(x)
+        y, _ = self.lstm2(y)
+        y = self.fc1(y)
+        y = self.act1(y)
+        y = self.fc2(y)
+        y = self.act2(y)
+        return y
 
 
 def build_lstm(input_shape: tuple, output_size: int):
     """
     The LSTM neural network for learning streamflow prediction error.
+    input_shape: (seq_len, feature_count)
     """
-    net = tf.keras.Sequential()
-
-    net.add(
-        tf.keras.layers.Bidirectional(
-            tf.keras.layers.LSTM(
-                128,
-                input_shape=input_shape,
-                activation="relu",
-                # recurrent_regularizer=tf.keras.regularizers.l2(6e-3),
-                return_sequences=True,
-            )
-        )
-    )
-    # net.add(
-    #     tf.keras.layers.Bidirectional(
-    #         tf.keras.layers.LSTM(
-    #             64,
-    #             activation="relu",
-    #             recurrent_regularizer=tf.keras.regularizers.l2(6e-3),
-    #             return_sequences=True,
-    #         )
-    #     )
-    # )
-    net.add(tf.keras.layers.Dense(32, activation="selu"))
-    # net.add(tf.keras.layers.Dropout(0.1))
-    net.add(tf.keras.layers.Dense(output_size))
-
-    return net
+    input_size = int(input_shape[1])
+    return LSTMNet(input_size=input_size, output_size=output_size)

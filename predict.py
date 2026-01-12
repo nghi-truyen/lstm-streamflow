@@ -8,15 +8,12 @@ import pandas as pd
 
 from tools import model_to_df, feature_engineering, df_to_network_in, build_lstm
 
-import tensorflow as tf
+import torch
+import torch.nn as nn
 
 # % Check version and GPU
-print("Tensorflow version: ", tf.__version__)
-
-print(
-    "GPU available: ",
-    tf.test.is_gpu_available(cuda_only=False, min_cuda_compute_capability=None),
-)
+print("PyTorch version: ", torch.__version__)
+print("GPU available: ", torch.cuda.is_available())
 
 
 # = ARGUMENT PARSER ==
@@ -35,24 +32,15 @@ parser.add_argument(
     "-pn",
     "--path_net",
     type=str,
-    help="Select the trained neural network to correct the Model object",
+    help="Path to trained network weights (.pth/.pt) or a directory containing one",
 )
 
 parser.add_argument(
     "-po",
     "--path_fileout",
     type=str,
-    default=f"{os.getcwd()}/bias-pred.csv",
+    default=f"{os.getcwd()}/discharge-pred.csv",
     help="[optional] Select path for the output file",
-)
-
-parser.add_argument(
-    "-gp",
-    "--gaussian_parameters",
-    type=str,
-    default="std",
-    choices=["mean", "std", "both"],
-    help="[optional] The optimized Gaussian parameters",
 )
 
 parser.add_argument(
@@ -73,15 +61,12 @@ parser.add_argument(
 
 args = parser.parse_args()
 
-# gauge_test = ["V4145210"]
-
 
 # = PRE-PROCESSING DATA ==
 # ========================
 
 # % Read model to csv and feature engineering
 model = smash.io.read_model(args.path_filemodel)
-# df = model_to_df(model, args.sequence_size, gauge=gauge_test)
 df = model_to_df(model, args.sequence_size)
 df = feature_engineering(df)
 
@@ -100,39 +85,63 @@ try:
 except:
     pass
 
-output_size = 2 if args.gaussian_parameters == "both" else 1
+output_size = 1
 
-k_fold = len([f for f in os.listdir(args.path_net) if f.endswith(".index")])
+# Resolve weight path: accept a file or directory
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-nets = []
+if os.path.isdir(args.path_net):
+    candidates = sorted(
+        [
+            os.path.join(args.path_net, f)
+            for f in os.listdir(args.path_net)
+            if f.endswith(".pt") or f.endswith(".pth")
+        ]
+    )
+    if len(candidates) == 0:
+        raise FileNotFoundError(
+            f"No weight files (*.pt|*.pth) found in directory: {args.path_net}"
+        )
+    weight_path = candidates[0]
+else:
+    weight_path = args.path_net
+    if not os.path.isfile(weight_path):
+        raise FileNotFoundError(f"Weight file not found: {weight_path}")
 
-# % Predict with tf session
-strategy = tf.distribute.MirroredStrategy()
+net = build_lstm(pred.shape[-2:], output_size)
+state = torch.load(weight_path, map_location=device)
+net.load_state_dict(state)
+if torch.cuda.device_count() > 1:
+    net = nn.DataParallel(net)
+net.to(device)
+net.eval()
 
-with strategy.scope():
-    for fold in range(k_fold):
-        net = build_lstm(pred.shape[-2:], output_size)
-        net.load_weights(os.path.join(args.path_net, f"fold_{fold + 1}"))
-        nets.append(net)
+with torch.no_grad():
+    pred_tensor = torch.from_numpy(pred.astype(np.float32)).to(device)
+    out_chunks = []
+    for i in range(0, pred_tensor.size(0), args.batch_size):
+        batch = pred_tensor[i : i + args.batch_size]
+        out = net(batch)
+        out_chunks.append(out)
+    y_pred = torch.cat(out_chunks, dim=0).cpu().numpy().reshape(-1, output_size)
 
-    y_pred = np.mean(
-        [net.predict(pred, batch_size=args.batch_size) for net in nets], axis=0
-    ).reshape(-1, output_size)
+discharge = y_pred[:, 0]
 
-if args.gaussian_parameters == "mean":
-    bias = y_pred[:, 0]
-elif args.gaussian_parameters == "std":
-    bias = np.random.normal(0, np.abs(y_pred[:, 0]))
-elif args.gaussian_parameters == "both":
-    bias = np.random.normal(y_pred[:, 0], np.abs(y_pred[:, 1]))
-
-# % Write results to csv file
-df_pred = pd.DataFrame(
+# % Write results to csv file with full series and -99 for missing
+df_pred_raw = pd.DataFrame(
     {
         "code": pred_set["code"],
         "timestep": pred_set["timestep"],
-        "bias": bias,
+        "discharge": discharge,
     }
 )
-df_pred = df_pred.pivot(index="timestep", columns="code", values="bias").reset_index()
+
+# Create full index from original df and left-join predictions
+df_full_index = df[["code", "timestep"]].drop_duplicates()
+df_pred = df_full_index.merge(df_pred_raw, on=["code", "timestep"], how="left")
+df_pred["discharge"] = df_pred["discharge"].fillna(-99)
+
+df_pred = df_pred.pivot(
+    index="timestep", columns="code", values="discharge"
+).reset_index()
 df_pred.to_csv(args.path_fileout, index=False)
