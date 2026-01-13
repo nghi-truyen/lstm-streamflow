@@ -85,8 +85,6 @@ try:
 except:
     pass
 
-output_size = 1
-
 # Resolve weight path: accept a file or directory
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -108,7 +106,7 @@ else:
     if not os.path.isfile(weight_path):
         raise FileNotFoundError(f"Weight file not found: {weight_path}")
 
-net = build_lstm(pred.shape[-2:], output_size)
+net = build_lstm(pred.shape[-2:], 1)
 state = torch.load(weight_path, map_location=device)
 net.load_state_dict(state)
 if torch.cuda.device_count() > 1:
@@ -123,7 +121,7 @@ with torch.no_grad():
         batch = pred_tensor[i : i + args.batch_size]
         out = net(batch)
         out_chunks.append(out)
-    y_pred = torch.cat(out_chunks, dim=0).cpu().numpy().reshape(-1, output_size)
+    y_pred = torch.cat(out_chunks, dim=0).cpu().numpy().reshape(-1, 1)
 
 discharge = y_pred[:, 0]
 

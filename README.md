@@ -39,7 +39,7 @@ def predict_discharge(model: smash.Model, df: pd.DataFrame):
     q = model_pred.response.q
 
     for i, code in enumerate(model.mesh.code):
-        if code in df.columns[1:]:
+        if code in df.columns:
             q[i, df["timestep"].values] = df[code].values
 
     return model_pred

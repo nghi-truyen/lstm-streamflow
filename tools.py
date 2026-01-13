@@ -47,8 +47,7 @@ def model_to_df(
     if target_mode:
         qo = model.response_data.q[..., :ntime_step]
         qo[qo < 0] = np.nan
-        discharge = qo  # - qs
-        dict_df["discharge"] = discharge.flatten(order="C")
+        dict_df["discharge"] = qo.flatten(order="C")
 
     # % Mean precipitation
     if precip:
@@ -134,7 +133,6 @@ def feature_engineering(df: pd.DataFrame):
 def df_to_network_in(
     df: pd.DataFrame,
     sequence_size: int,
-    output_size: int | None = None,
     target_mode: bool = False,
 ):
     """
@@ -153,7 +151,7 @@ def df_to_network_in(
         # convert to numpy array
         data = df.to_numpy()[..., :-1]
         target = df.to_numpy()[..., -1]
-        target = target.reshape(-1, sequence_size, output_size)
+        target = target.reshape(-1, sequence_size, 1)
 
     else:
         data = df.to_numpy()

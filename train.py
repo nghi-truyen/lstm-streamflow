@@ -106,12 +106,8 @@ missing = df[df.isna().any(axis=1)]["id"].unique()
 train_set = df[~df.id.isin(missing)]
 
 # % Normalize and prepare inputs for the network
-output_size = 1
-train, target = df_to_network_in(
-    train_set, args.sequence_size, output_size, target_mode=True
-)
+train, target = df_to_network_in(train_set, args.sequence_size, target_mode=True)
 
-print(train.shape, target.shape)
 
 # = TRAINING ==
 # =============
@@ -124,16 +120,17 @@ def make_optimizer(name: str, params, lr: float):
     name = name.lower()
     if name == "adam":
         return torch.optim.Adam(params, lr=lr)
-    if name == "sgd":
+    elif name == "sgd":
         return torch.optim.SGD(params, lr=lr, momentum=0.9)
-    if name == "adamw":
+    elif name == "adamw":
         return torch.optim.AdamW(params, lr=lr)
-    return torch.optim.Adam(params, lr=lr)
+    else:
+        raise ValueError(f"Unknown optimizer: {name}")
 
 
 print("</> Training LSTM model...")
 
-net = build_lstm(train.shape[-2:], output_size)
+net = build_lstm(train.shape[-2:], 1)
 if torch.cuda.device_count() > 1:
     net = nn.DataParallel(net)
 net.to(device)
